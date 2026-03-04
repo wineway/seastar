@@ -3,6 +3,7 @@
  */
 
 #include <seastar/websocket/server.hh>
+#include <seastar/websocket/client.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/http/response_parser.hh>
@@ -249,5 +250,70 @@ SEASTAR_TEST_CASE(test_websocket_parser_split) {
 
             BOOST_REQUIRE_EQUAL(results, expected);
         }
+    });
+}
+
+SEASTAR_TEST_CASE(test_websocket_client_server) {
+    return seastar::async([] {
+        loopback_connection_factory factory;
+        loopback_socket_impl lsi(factory);
+
+        // Setup server side
+        websocket::server ws;
+        ws.register_handler("echo", [] (input_stream<char>& in,
+                        output_stream<char>& out) {
+            return repeat([&in, &out]() {
+                return in.read().then([&out](temporary_buffer<char> f) {
+                    if (f.empty()) {
+                        return make_ready_future<stop_iteration>(stop_iteration::yes);
+                    }
+                    return out.write(std::move(f)).then([&out]() {
+                        return out.flush().then([] {
+                            return make_ready_future<stop_iteration>(stop_iteration::no);
+                        });
+                    });
+                });
+            });
+        });
+
+        auto acceptor = factory.get_server_socket().accept();
+        auto connector = lsi.connect(socket_address(), socket_address());
+
+        // Server side
+        connected_socket server_sock = acceptor.get().connection;
+        websocket::server_connection server_conn(ws, std::move(server_sock));
+        future<> serve = server_conn.process();
+
+        // Client side
+        connected_socket client_sock = connector.get();
+
+        sstring received_data;
+        promise<> client_done;
+
+        websocket::client_connection client_conn(std::move(client_sock), "/", "localhost",
+            "echo",
+            [&received_data, &client_done] (input_stream<char>& in, output_stream<char>& out) -> future<> {
+                co_await out.write("hello");
+                co_await out.flush();
+
+                auto buf = co_await in.read();
+                received_data = sstring(buf.get(), buf.size());
+
+                co_await out.close();
+                client_done.set_value();
+            });
+
+        future<> client_process = client_conn.process().handle_exception(
+            [] (std::exception_ptr) {});
+
+        client_done.get_future().get();
+
+        BOOST_REQUIRE_EQUAL(received_data, "hello");
+
+        // Shut down cleanly: close client first (sends CLOSE frame), then server
+        client_conn.close().get();
+        client_process.get();
+        server_conn.close().get();
+        serve.get();
     });
 }

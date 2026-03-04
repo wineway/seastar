@@ -39,7 +39,7 @@ namespace seastar::experimental::websocket {
 /*!
  * \brief a server WebSocket connection
  */
-class server_connection : public connection {
+class server_connection : public connection<false> {
 
     server& _server;
     http_request_parser _http_parser;
