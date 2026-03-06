@@ -53,7 +53,7 @@ public:
 /*!
  * \brief a server WebSocket connection
  */
-template <bool is_client = false>
+template <bool is_client = false, bool text_frame = false>
 class connection : public boost::intrusive::list_base_hook<> {
 protected:
     using buff_t = temporary_buffer<char>;
