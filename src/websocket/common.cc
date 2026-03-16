@@ -20,6 +20,7 @@
  */
 
 #include <seastar/core/future.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <seastar/websocket/common.hh>
 #include <seastar/core/byteorder.hh>
 #include <seastar/core/when_all.hh>
@@ -29,6 +30,7 @@
 #include <gnutls/gnutls.h>
 #include <random>
 #include <seastar/websocket/parser.hh>
+#include <tuple>
 
 namespace seastar::experimental::websocket {
 
@@ -36,7 +38,7 @@ logger websocket_logger("websocket");
 
 template <bool is_client, bool text_frame>
 future<> basic_connection<is_client, text_frame>::handle_ping(temporary_buffer<char> buff) {
-    return send_data(opcodes::PONG, std::move(buff));
+    return _output_buffer.push_eventually(std::make_tuple(opcodes::PONG, std::move(buff)));
 }
 
 template <bool is_client, bool text_frame>
@@ -96,13 +98,24 @@ template <bool is_client, bool text_frame>
 future<> basic_connection<is_client, text_frame>::response_loop() {
     return do_until([this] {return _done;}, [this] {
         // FIXME: implement error handling
-        return _output_buffer.pop_eventually().then([this] (
-                temporary_buffer<char> buf) {
-            if (!buf) {
+        return _output_buffer.pop_eventually().then([this] (frame_t frame) {
+            auto& [opcode, buf] = frame;
+            if (opcode == opcodes::INVALID) {
                 return make_ready_future<>();
             }
-            return send_data(text_frame ? opcodes::TEXT : opcodes::BINARY, std::move(buf));
+            return send_data(opcode, std::move(buf)).then([this, opcode] () {
+                    if (_close_send && opcode == opcodes::CLOSE) {
+                        // _output_buffer was drained
+                        _close_send->set_value();
+                        _close_send.reset();
+                    }
+                });
         });
+    }).handle_exception([this] (std::exception_ptr e) {
+        if (_close_send) {
+            _close_send->set_exception(e);
+            _close_send.reset();
+        }
     }).finally([this]() {
         return _write_buf.close();
     });
@@ -121,7 +134,12 @@ future<> basic_connection<is_client, text_frame>::close(bool send_close) {
     _half_close = true;
     return [this, send_close]() {
         if (send_close) {
-            return send_data(opcodes::CLOSE, temporary_buffer<char>(0));
+            _close_send.emplace();
+            auto f = _close_send->get_future();
+            return _output_buffer.push_eventually(std::make_tuple(opcodes::CLOSE, temporary_buffer<char>(0)))
+                .then([ f = std::move(f)]() mutable {
+                        return std::move(f);
+                });
         } else {
             return make_ready_future<>();
         }

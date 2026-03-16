@@ -21,12 +21,14 @@
 
 #pragma once
 
+#include <exception>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/net/api.hh>
 #include <seastar/util/log.hh>
 #include <seastar/websocket/parser.hh>
+#include <tuple>
 
 namespace seastar::experimental::websocket {
 
@@ -83,24 +85,30 @@ protected:
         }
     };
 
+    using frame_t = std::tuple<opcodes, buff_t>;
+
     /*!
      * \brief Implementation of connection's data sink.
      */
     class connection_sink_impl final : public data_sink_impl {
-        queue<buff_t>* data;
+        queue<frame_t>* data;
+
+        opcodes opcode() {
+            return text_frame ? opcodes::TEXT : opcodes::BINARY;
+        }
     public:
-        connection_sink_impl(queue<buff_t>* data) : data(data) {}
+        connection_sink_impl(queue<frame_t>* data) : data(data) {}
 
 #if SEASTAR_API_LEVEL >= 9
         future<> put(std::span<temporary_buffer<char>> d) override {
             return data_sink_impl::fallback_put(d, [this] (temporary_buffer<char>&& buf) {
-                return data->push_eventually(std::move(buf));
+                return data->push_eventually(std::make_tuple(opcode(), std::move(buf)));
             });
         }
 #else
         virtual future<> put(net::packet d) override {
             net::fragment f = d.frag(0);
-            return data->push_eventually(temporary_buffer<char>{std::move(f.base), f.size});
+            return data->push_eventually(std::make_tuple(opcode(), temporary_buffer<char>{std::move(f.base), f.size}));
         }
 #endif
 
@@ -109,7 +117,8 @@ protected:
         }
 
         virtual future<> close() override {
-            data->push(buff_t(0));
+            // use opcodes::INVALID indicate stream was closed
+            data->push(std::make_tuple(opcodes::INVALID, buff_t(0)));
             return make_ready_future<>();
         }
     };
@@ -136,8 +145,9 @@ protected:
     websocket_parser _websocket_parser;
     queue <temporary_buffer<char>> _input_buffer;
     input_stream<char> _input;
-    queue <temporary_buffer<char>> _output_buffer;
+    queue <frame_t> _output_buffer;
     output_stream<char> _output;
+    std::optional<promise<>> _close_send;
 
     sstring _subprotocol;
     handler_t _handler;
