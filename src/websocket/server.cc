@@ -113,7 +113,8 @@ future<> server_connection::read_http_upgrade_request() {
     co_await _read_buf.consume(_http_parser);
 
     if (_http_parser.eof()) {
-        _done = true;
+        // FIXME(wineway)
+        handle_event(connection_event::reset);
         co_return;
     }
     std::unique_ptr<http::request> req = _http_parser.get_parsed_request();
@@ -157,16 +158,13 @@ future<> server_connection::read_http_upgrade_request() {
 
 future<> server_connection::read_loop() {
     return read_http_upgrade_request().then([this] {
+        handle_event(connection_event::handshake_done);
         return when_all_succeed(
             _handler(_input, _output).handle_exception([this] (std::exception_ptr e) mutable {
-                return _read_buf.close().then([e = std::move(e)] () mutable {
-                    return make_exception_future<>(std::move(e));
-                });
+                return handle_exception(e);
             }),
-            do_until([this] {return _done;}, [this] {return read_one();})
+            do_until([this] {return stop_read_loop();}, [this] {return read_one();})
         ).discard_result();
-    }).finally([this] {
-        return _read_buf.close();
     });
 }
 

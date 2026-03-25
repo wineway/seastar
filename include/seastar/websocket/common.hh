@@ -60,6 +60,22 @@ class basic_connection : public boost::intrusive::list_base_hook<> {
 protected:
     using buff_t = temporary_buffer<char>;
 
+    enum class websocket_state {
+        connecting,
+        open,
+        closing,
+        closed,
+    };
+
+    enum class connection_event {
+        handshake_done,
+        send_close,
+        close_sending,
+        close_sent,
+        recv_close,
+        reset,
+    };
+
     /*!
      * \brief Implementation of connection's data source.
      */
@@ -138,16 +154,15 @@ protected:
     connected_socket _fd;
     input_stream<char> _read_buf;
     output_stream<char> _write_buf;
-    bool _done = false;
-    // TODO: implement https://datatracker.ietf.org/doc/html/rfc6455#section-7.1.2
-    bool _half_close = false;
+    websocket_state _state;
+    bool _close_sent = false;
+    bool _close_recv = false;
 
     websocket_parser _websocket_parser;
     queue <temporary_buffer<char>> _input_buffer;
     input_stream<char> _input;
     queue <frame_t> _output_buffer;
     output_stream<char> _output;
-    std::optional<promise<>> _close_send;
 
     sstring _subprotocol;
     handler_t _handler;
@@ -161,6 +176,7 @@ public:
         : _fd(std::move(fd))
         , _read_buf(_fd.input())
         , _write_buf(_fd.output())
+        , _state(websocket_state::connecting)
         , _websocket_parser(!is_client)
         , _input_buffer{PIPE_SIZE}
         , _input(data_source{std::make_unique<connection_source_impl>(&_input_buffer)})
@@ -178,6 +194,10 @@ public:
 protected:
     future<> read_one();
     future<> response_loop();
+    bool stop_read_loop();
+    future<> handle_exception(std::exception_ptr e);
+    bool stop_response_loop();
+    void handle_event(connection_event event);
     /*!
      * \brief Packs buff in websocket frame and sends it to the client.
      */

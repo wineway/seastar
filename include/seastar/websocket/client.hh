@@ -47,6 +47,8 @@ class client_connection : public basic_connection<true, text_frame> {
     future<> send_http_upgrade_request();
     future<> read_http_upgrade_response();
 
+    using connection_event = typename basic_connection<true, text_frame>::connection_event;
+
 public:
     /*!
      * \param fd established socket used for communication

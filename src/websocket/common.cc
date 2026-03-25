@@ -19,8 +19,10 @@
  * Copyright 2024 ScyllaDB
  */
 
+#include <fcntl.h>
 #include <seastar/core/future.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/seastar.hh>
 #include <seastar/websocket/common.hh>
 #include <seastar/core/byteorder.hh>
 #include <seastar/core/when_all.hh>
@@ -96,28 +98,23 @@ future<> basic_connection<is_client, text_frame>::send_data(opcodes opcode, temp
 
 template <bool is_client, bool text_frame>
 future<> basic_connection<is_client, text_frame>::response_loop() {
-    return do_until([this] {return _done;}, [this] {
+    return do_until([this] {return stop_response_loop();}, [this] {
         // FIXME: implement error handling
         return _output_buffer.pop_eventually().then([this] (frame_t frame) {
             auto& [opcode, buf] = frame;
-            if (opcode == opcodes::INVALID) {
-                return make_ready_future<>();
+            if ((_state == websocket_state::open) || (_state == websocket_state::closing && !_close_sent && opcode == opcodes::CLOSE)) {
+                return send_data(opcode, std::move(buf)).then([this, opcode] () {
+                        if (opcode == opcodes::CLOSE) {
+                           handle_event(connection_event::close_sent);
+                           return _write_buf.close();
+                        }
+
+                        return make_ready_future();
+                    });
             }
-            return send_data(opcode, std::move(buf)).then([this, opcode] () {
-                    if (_close_send && opcode == opcodes::CLOSE) {
-                        // _output_buffer was drained
-                        _close_send->set_value();
-                        _close_send.reset();
-                    }
-                });
+
+            return make_ready_future();
         });
-    }).handle_exception([this] (std::exception_ptr e) {
-        if (_close_send) {
-            _close_send->set_exception(e);
-            _close_send.reset();
-        }
-    }).finally([this]() {
-        return _write_buf.close();
     });
 }
 
@@ -126,37 +123,102 @@ void basic_connection<is_client, text_frame>::shutdown_input() {
     _fd.shutdown_input();
 }
 
+
+template <bool is_client, bool text_frame>
+void basic_connection<is_client, text_frame>::handle_event(connection_event event) {
+    if (connection_event::reset == event) {
+        _state = websocket_state::closed;
+        return;
+    }
+    switch (_state) {
+        case websocket_state::connecting:
+            SEASTAR_ASSERT(event == connection_event::handshake_done);
+            _state = websocket_state::open;
+            break;
+        case websocket_state::closed:
+            SEASTAR_ASSERT(false);
+            break;
+        case websocket_state::closing:
+            if (connection_event::close_sending == event) {
+                SEASTAR_ASSERT(!_close_sent);
+                SEASTAR_ASSERT(_close_recv);
+                return;
+            } else if (connection_event::close_sent == event) {
+                SEASTAR_ASSERT(!_close_sent);
+                _close_sent = true;
+            } else if (connection_event::recv_close == event) {
+                SEASTAR_ASSERT(!_close_recv);
+                _close_recv = true;
+            }
+
+            _state = websocket_state::closed;
+            break;
+        case websocket_state::open:
+            if (connection_event::close_sending == event) {
+                SEASTAR_ASSERT(!_close_sent);
+                _state = websocket_state::closing;
+            } else if (connection_event::recv_close == event) {
+                SEASTAR_ASSERT(!_close_recv);
+                _close_recv = true;
+                _state = websocket_state::closing;
+            } else {
+                _state = websocket_state::closed;
+            }
+            break;
+        }
+}
+
 template <bool is_client, bool text_frame>
 future<> basic_connection<is_client, text_frame>::close(bool send_close) {
-    if (_half_close) {
-        return make_ready_future<>();
-    }
-    _half_close = true;
     return [this, send_close]() {
         if (send_close) {
-            _close_send.emplace();
-            auto f = _close_send->get_future();
-            return _output_buffer.push_eventually(std::make_tuple(opcodes::CLOSE, temporary_buffer<char>(0)))
-                .then([ f = std::move(f)]() mutable {
-                        return std::move(f);
-                });
+            handle_event(connection_event::close_sending);
+            return _output_buffer.push_eventually(std::make_tuple(opcodes::CLOSE, temporary_buffer<char>(0)));
         } else {
+            _state = websocket_state::closed;
             return make_ready_future<>();
         }
     }().finally([this] {
-        _done = true;
-        return when_all_succeed(_input.close(), _output.close()).discard_result().finally([this] {
-            _fd.shutdown_output();
-        });
+        return when_all_succeed(_input.close(), _output.close()).discard_result();
     });
+}
+
+template <bool is_client, bool text_frame>
+future<> basic_connection<is_client, text_frame>::handle_exception(std::exception_ptr e) {
+    switch (_state) {
+    case websocket_state::connecting:
+    case websocket_state::open:
+    case websocket_state::closing:
+    case websocket_state::closed:
+        _state = websocket_state::closed;
+        return when_all_succeed(_read_buf.close(), _write_buf.close()).discard_result();
+      break;
+    }
+
+    return make_ready_future();
+}
+
+template <bool is_client, bool text_frame>
+bool basic_connection<is_client, text_frame>::stop_read_loop() {
+    return _state == websocket_state::closed
+                    || (_state == websocket_state::closing && this->_close_recv);
+}
+
+template <bool is_client, bool text_frame>
+bool basic_connection<is_client, text_frame>::stop_response_loop() {
+    return _state == websocket_state::closed
+                    || (_state == websocket_state::closing && this->_close_sent);
 }
 
 template <bool is_client, bool text_frame>
 future<> basic_connection<is_client, text_frame>::read_one() {
     return _read_buf.consume(_websocket_parser).then([this] () mutable {
         if (_websocket_parser.is_valid()) {
-            if (_half_close) {
-                // When the connection enters _half_closed state, just wait for the close to complete.
+            if (_state == websocket_state::closing && _websocket_parser.opcode() == opcodes::CLOSE && !_close_recv) {
+                handle_event(connection_event::recv_close);
+                return _read_buf.close();
+            }
+            if (_state != websocket_state::open) {
                 return make_ready_future();
             }
             // FIXME: implement error handling
@@ -168,6 +230,7 @@ future<> basic_connection<is_client, text_frame>::read_one() {
                 return _input_buffer.push_eventually(_websocket_parser.result());
             case opcodes::CLOSE:
                 websocket_logger.debug("Received close frame.");
+                handle_event(connection_event::recv_close);
                 // datatracker.ietf.org/doc/html/rfc6455#section-5.5.1
                 return close(true);
             case opcodes::PING:
@@ -181,10 +244,12 @@ future<> basic_connection<is_client, text_frame>::read_one() {
                 ;
             }
         } else if (_websocket_parser.eof()) {
+            handle_event(connection_event::reset);
             return close(false);
         }
-        websocket_logger.debug("Reading from socket has failed.");
-        return close(true);
+
+        throw exception("Parse websocket frame failed");
+
     });
 }
 

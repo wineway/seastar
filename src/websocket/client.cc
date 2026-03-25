@@ -124,6 +124,8 @@ template <bool text_frame>
 future<> client_connection<text_frame>::handshake() {
     co_await send_http_upgrade_request();
     co_await read_http_upgrade_response();
+
+    this->handle_event(connection_event::handshake_done);
 }
 
 template <bool text_frame>
@@ -131,12 +133,11 @@ future<> client_connection<text_frame>::process() {
     co_await coroutine::all(
         [this] () -> future<> {
             co_await this->_handler(this->_input, this->_output).handle_exception([this] (std::exception_ptr e) -> future<> {
-                co_await this->_read_buf.close();
-                std::rethrow_exception(e);
+                co_await this->handle_exception(e);
             });
         },
         [this] () -> future<> {
-            while (!this->_done) {
+            while (!this->stop_read_loop()) {
                 co_await this->read_one();
             }
         },
@@ -188,7 +189,6 @@ template <bool text_frame>
 future<> client<text_frame>::close() {
     if (_conn) {
         co_await _conn->close(true).handle_exception([] (auto) {});
-        _conn->shutdown_input();
     }
     co_await _task_gate.close();
 }
