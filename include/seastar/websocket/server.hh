@@ -62,7 +62,6 @@ public:
     future<> process();
 
 protected:
-    future<> read_loop();
     future<> read_http_upgrade_request();
     void on_new_connection();
 };

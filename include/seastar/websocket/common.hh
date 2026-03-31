@@ -69,11 +69,11 @@ protected:
 
     enum class connection_event {
         handshake_done,
-        send_close,
         close_sending,
         close_sent,
         recv_close,
-        reset,
+        read_exit,
+        write_exit
     };
 
     /*!
@@ -157,11 +157,13 @@ protected:
     websocket_state _state;
     bool _close_sent = false;
     bool _close_recv = false;
+    bool _read_closed = false;
+    bool _write_closed = false;
 
     websocket_parser _websocket_parser;
-    queue <temporary_buffer<char>> _input_buffer;
+    queue<temporary_buffer<char>> _input_buffer;
     input_stream<char> _input;
-    queue <frame_t> _output_buffer;
+    queue<frame_t> _output_buffer;
     output_stream<char> _output;
 
     sstring _subprotocol;
@@ -194,8 +196,8 @@ public:
 protected:
     future<> read_one();
     future<> response_loop();
+    future<> read_loop();
     bool stop_read_loop();
-    future<> handle_exception(std::exception_ptr e);
     bool stop_response_loop();
     void handle_event(connection_event event);
     /*!

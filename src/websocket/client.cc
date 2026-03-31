@@ -24,6 +24,7 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/http/reply.hh>
+#include <seastar/websocket/common.hh>
 
 namespace seastar::experimental::websocket {
 
@@ -130,21 +131,12 @@ future<> client_connection<text_frame>::handshake() {
 
 template <bool text_frame>
 future<> client_connection<text_frame>::process() {
-    co_await coroutine::all(
-        [this] () -> future<> {
-            co_await this->_handler(this->_input, this->_output).handle_exception([this] (std::exception_ptr e) -> future<> {
-                co_await this->handle_exception(e);
-            });
-        },
-        [this] () -> future<> {
-            while (!this->stop_read_loop()) {
-                co_await this->read_one();
-            }
-        },
-        [this] () {
-            return this->response_loop();
-        }
-    );
+    return when_all_succeed(
+            this->read_loop(),
+            this->response_loop()
+        ).discard_result().handle_exception([] (const std::exception_ptr& e) {
+        websocket_logger.debug("Processing failed: {}", e);
+    });
 }
 
 template <bool text_frame>

@@ -48,6 +48,7 @@ class client_connection : public basic_connection<true, text_frame> {
     future<> read_http_upgrade_response();
 
     using connection_event = typename basic_connection<true, text_frame>::connection_event;
+    using websocket_state = typename basic_connection<true, text_frame>::websocket_state;
 
 public:
     /*!

@@ -19,6 +19,7 @@
  * Copyright 2021 ScyllaDB
  */
 
+#include <seastar/websocket/common.hh>
 #include <seastar/websocket/server.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/loop.hh>
@@ -79,19 +80,16 @@ future<stop_iteration> server::accept_one(server_socket &listener) {
 }
 
 future<> server::stop() {
+    websocket_logger.info("server close");
     for (auto&& l : _listeners) {
         l.abort_accept();
     }
-
-    for (auto&& c : _connections) {
-        c.shutdown_input();
-    }
-
-    return _task_gate.close().finally([this] {
-        return parallel_for_each(_connections, [] (server_connection& conn) {
-            return conn.close(true).handle_exception([] (auto ignored) {});
-        });
+    return parallel_for_each(_connections, [] (server_connection& conn) {
+        return conn.close(true).handle_exception([] (auto ignored) {});
+    }).finally([this](){
+        return _task_gate.close();
     });
+
 }
 
 server_connection::~server_connection() {
@@ -103,7 +101,10 @@ void server_connection::on_new_connection() {
 }
 
 future<> server_connection::process() {
-    return when_all_succeed(read_loop(), response_loop()).discard_result().handle_exception([] (const std::exception_ptr& e) {
+    return when_all_succeed(read_http_upgrade_request().then([this](){
+        handle_event(connection_event::handshake_done);
+        return read_loop();
+    }), response_loop()).discard_result().handle_exception([] (const std::exception_ptr& e) {
         websocket_logger.debug("Processing failed: {}", e);
     });
 }
@@ -114,8 +115,7 @@ future<> server_connection::read_http_upgrade_request() {
 
     if (_http_parser.eof()) {
         // FIXME(wineway)
-        handle_event(connection_event::reset);
-        co_return;
+        throw websocket::exception("Unrecogenized upgrade request");
     }
     std::unique_ptr<http::request> req = _http_parser.get_parsed_request();
     if (_http_parser.failed()) {
@@ -154,18 +154,6 @@ future<> server_connection::read_http_upgrade_request() {
     }
     co_await _write_buf.write("\r\n\r\n", 4);
     co_await _write_buf.flush();
-}
-
-future<> server_connection::read_loop() {
-    return read_http_upgrade_request().then([this] {
-        handle_event(connection_event::handshake_done);
-        return when_all_succeed(
-            _handler(_input, _output).handle_exception([this] (std::exception_ptr e) mutable {
-                return handle_exception(e);
-            }),
-            do_until([this] {return stop_read_loop();}, [this] {return read_one();})
-        ).discard_result();
-    });
 }
 
 bool server::is_handler_registered(std::string const& name) {

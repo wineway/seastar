@@ -19,8 +19,8 @@
  * Copyright 2024 ScyllaDB
  */
 
-#include <fcntl.h>
 #include <seastar/core/future.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/websocket/common.hh>
@@ -97,16 +97,34 @@ future<> basic_connection<is_client, text_frame>::send_data(opcodes opcode, temp
 }
 
 template <bool is_client, bool text_frame>
+future<> basic_connection<is_client, text_frame>::read_loop() {
+    return when_all_succeed(
+            _handler(_input, _output),
+            do_until([this] {return stop_read_loop();}, [this] {
+                return read_one();
+            })
+        ).discard_result()
+        .finally([this](){
+            if (!_read_closed) {
+                _read_closed = true;
+                handle_event(connection_event::read_exit);
+                return _read_buf.close();
+            }
+
+            return make_ready_future();
+        });
+}
+
+template <bool is_client, bool text_frame>
 future<> basic_connection<is_client, text_frame>::response_loop() {
     return do_until([this] {return stop_response_loop();}, [this] {
         // FIXME: implement error handling
         return _output_buffer.pop_eventually().then([this] (frame_t frame) {
             auto& [opcode, buf] = frame;
-            if ((_state == websocket_state::open) || (_state == websocket_state::closing && !_close_sent && opcode == opcodes::CLOSE)) {
+            if ((_state == websocket_state::open || _state == websocket_state::closing) && opcode != opcodes::INVALID) {
                 return send_data(opcode, std::move(buf)).then([this, opcode] () {
                         if (opcode == opcodes::CLOSE) {
                            handle_event(connection_event::close_sent);
-                           return _write_buf.close();
                         }
 
                         return make_ready_future();
@@ -115,7 +133,12 @@ future<> basic_connection<is_client, text_frame>::response_loop() {
 
             return make_ready_future();
         });
-    });
+    }).finally([this](){
+        this->_write_closed = true;
+        this->handle_event(connection_event::write_exit);
+        return this->_write_buf.close();
+    })
+;
 }
 
 template <bool is_client, bool text_frame>
@@ -126,17 +149,14 @@ void basic_connection<is_client, text_frame>::shutdown_input() {
 
 template <bool is_client, bool text_frame>
 void basic_connection<is_client, text_frame>::handle_event(connection_event event) {
-    if (connection_event::reset == event) {
-        _state = websocket_state::closed;
-        return;
-    }
+    websocket_logger.debug("[{}] handle_event: connection state={} event={}", fmt::ptr(this), static_cast<int>(_state), static_cast<int>(event));
     switch (_state) {
         case websocket_state::connecting:
             SEASTAR_ASSERT(event == connection_event::handshake_done);
             _state = websocket_state::open;
             break;
         case websocket_state::closed:
-            SEASTAR_ASSERT(false);
+            SEASTAR_ASSERT(connection_event::read_exit == event || connection_event::write_exit == event);
             break;
         case websocket_state::closing:
             if (connection_event::close_sending == event) {
@@ -146,6 +166,7 @@ void basic_connection<is_client, text_frame>::handle_event(connection_event even
             } else if (connection_event::close_sent == event) {
                 SEASTAR_ASSERT(!_close_sent);
                 _close_sent = true;
+                if (!_close_recv) return;
             } else if (connection_event::recv_close == event) {
                 SEASTAR_ASSERT(!_close_recv);
                 _close_recv = true;
@@ -170,6 +191,9 @@ void basic_connection<is_client, text_frame>::handle_event(connection_event even
 
 template <bool is_client, bool text_frame>
 future<> basic_connection<is_client, text_frame>::close(bool send_close) {
+    if (websocket_state::closed == _state) {
+        return make_ready_future();
+    }
     return [this, send_close]() {
         if (send_close) {
             handle_event(connection_event::close_sending);
@@ -181,21 +205,6 @@ future<> basic_connection<is_client, text_frame>::close(bool send_close) {
     }().finally([this] {
         return when_all_succeed(_input.close(), _output.close()).discard_result();
     });
-}
-
-template <bool is_client, bool text_frame>
-future<> basic_connection<is_client, text_frame>::handle_exception(std::exception_ptr e) {
-    switch (_state) {
-    case websocket_state::connecting:
-    case websocket_state::open:
-    case websocket_state::closing:
-    case websocket_state::closed:
-        _state = websocket_state::closed;
-        return when_all_succeed(_read_buf.close(), _write_buf.close()).discard_result();
-      break;
-    }
-
-    return make_ready_future();
 }
 
 template <bool is_client, bool text_frame>
@@ -216,7 +225,7 @@ future<> basic_connection<is_client, text_frame>::read_one() {
         if (_websocket_parser.is_valid()) {
             if (_state == websocket_state::closing && _websocket_parser.opcode() == opcodes::CLOSE && !_close_recv) {
                 handle_event(connection_event::recv_close);
-                return _read_buf.close();
+                return make_ready_future();
             }
             if (_state != websocket_state::open) {
                 return make_ready_future();
@@ -244,8 +253,9 @@ future<> basic_connection<is_client, text_frame>::read_one() {
                 ;
             }
         } else if (_websocket_parser.eof()) {
-            handle_event(connection_event::reset);
-            return close(false);
+            _read_closed = true;
+            handle_event(connection_event::read_exit);
+            return make_ready_future();
         }
 
         throw exception("Parse websocket frame failed");
