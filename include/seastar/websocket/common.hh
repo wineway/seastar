@@ -196,9 +196,57 @@ public:
 protected:
     future<> read_one();
     future<> response_loop();
+    /*!
+     * \brief Enqueues a CLOSE frame to the output buffer and updates the state machine.
+     *
+     * Transitions the connection state from \c open to \c closing by firing
+     * \c connection_event::close_sending, then pushes an empty CLOSE frame onto
+     * \c _output_buffer for the response loop to transmit.
+     *
+     * This is the low-level primitive for initiating or echoing the WebSocket
+     * closing handshake. Callers are responsible for ensuring the connection is
+     * in the \c open state before calling this method; invoking it in any other
+     * state will trigger an assertion failure in \ref handle_event.
+     *
+     * \note Prefer \ref close over this method for externally-initiated shutdowns,
+     *       as \ref close includes the necessary state guard and notifies the
+     *       handler via \ref _input.
+     */
+    future<> send_close();
+    /*!
+     * \brief Runs the handler and the read loop concurrently.
+     *
+     * Invokes the user-supplied handler with the connection's input and output
+     * streams, while simultaneously reading and dispatching incoming WebSocket
+     * frames via \ref read_one. Both tasks must complete before this future
+     * resolves.
+     */
     future<> read_loop();
+    /*!
+     * \brief Returns true when the read loop should stop.
+     *
+     * The read loop stops when the connection is \c closed, or when it is
+     * \c closing and a CLOSE frame has already been received from the peer.
+     */
     bool stop_read_loop();
+    /*!
+     * \brief Returns true when the response loop should stop.
+     *
+     * The response loop stops when the connection is \c closed, or when it is
+     * \c closing and a CLOSE frame has already been sent to the peer.
+     */
     bool stop_response_loop();
+    /*!
+     * \brief Drives the WebSocket closing-handshake state machine.
+     *
+     * Transitions \c _state according to \p event. Valid events per state:
+     * - \c connecting: only \c handshake_done (advances to \c open).
+     * - \c open: \c close_sending, \c recv_close (both advance to \c closing),
+     *   or any other event (advances directly to \c closed).
+     * - \c closing: \c close_sent, \c recv_close (advance to \c closed once
+     *   both sides have exchanged CLOSE frames), or \c close_sending (no-op).
+     * - \c closed: only \c read_exit or \c write_exit.
+     */
     void handle_event(connection_event event);
     /*!
      * \brief Packs buff in websocket frame and sends it to the client.

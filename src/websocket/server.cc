@@ -115,7 +115,7 @@ future<> server_connection::read_http_upgrade_request() {
 
     if (_http_parser.eof()) {
         // FIXME(wineway)
-        throw websocket::exception("Unrecogenized upgrade request");
+        throw websocket::exception("Unrecognized upgrade request");
     }
     std::unique_ptr<http::request> req = _http_parser.get_parsed_request();
     if (_http_parser.failed()) {

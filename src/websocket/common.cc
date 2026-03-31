@@ -106,7 +106,6 @@ future<> basic_connection<is_client, text_frame>::read_loop() {
         ).discard_result()
         .finally([this](){
             if (!_read_closed) {
-                _read_closed = true;
                 handle_event(connection_event::read_exit);
                 return _read_buf.close();
             }
@@ -134,7 +133,6 @@ future<> basic_connection<is_client, text_frame>::response_loop() {
             return make_ready_future();
         });
     }).finally([this](){
-        this->_write_closed = true;
         this->handle_event(connection_event::write_exit);
         return this->_write_buf.close();
     })
@@ -170,6 +168,15 @@ void basic_connection<is_client, text_frame>::handle_event(connection_event even
             } else if (connection_event::recv_close == event) {
                 SEASTAR_ASSERT(!_close_recv);
                 _close_recv = true;
+                if (!_close_sent) return;
+            } else if (connection_event::read_exit == event) {
+                SEASTAR_ASSERT(!_read_closed);
+                _read_closed = true;
+                if (!_write_closed) return;
+            } else if (connection_event::write_exit == event) {
+                SEASTAR_ASSERT(!_write_closed);
+                _write_closed = true;
+                if (!_read_closed) return;
             }
 
             _state = websocket_state::closed;
@@ -182,6 +189,14 @@ void basic_connection<is_client, text_frame>::handle_event(connection_event even
                 SEASTAR_ASSERT(!_close_recv);
                 _close_recv = true;
                 _state = websocket_state::closing;
+            }  else if (connection_event::read_exit == event) {
+                SEASTAR_ASSERT(!_read_closed);
+                _read_closed = true;
+                _state = websocket_state::closed;
+            } else if (connection_event::write_exit == event) {
+                SEASTAR_ASSERT(!_write_closed);
+                _write_closed = true;
+                _state = websocket_state::closed;
             } else {
                 _state = websocket_state::closed;
             }
@@ -190,20 +205,25 @@ void basic_connection<is_client, text_frame>::handle_event(connection_event even
 }
 
 template <bool is_client, bool text_frame>
+future<> basic_connection<is_client, text_frame>::send_close() {
+    handle_event(connection_event::close_sending);
+    return _output_buffer.push_eventually(std::make_tuple(opcodes::CLOSE, temporary_buffer<char>(0)));
+}
+
+template <bool is_client, bool text_frame>
 future<> basic_connection<is_client, text_frame>::close(bool send_close) {
-    if (websocket_state::closed == _state) {
+    if (websocket_state::closed == _state || websocket_state::closing == _state) {
         return make_ready_future();
     }
     return [this, send_close]() {
         if (send_close) {
-            handle_event(connection_event::close_sending);
-            return _output_buffer.push_eventually(std::make_tuple(opcodes::CLOSE, temporary_buffer<char>(0)));
+            return this->send_close();
         } else {
             _state = websocket_state::closed;
             return make_ready_future<>();
         }
     }().finally([this] {
-        return when_all_succeed(_input.close(), _output.close()).discard_result();
+        return _input.close(); // notify _handler shutdown
     });
 }
 
@@ -241,7 +261,7 @@ future<> basic_connection<is_client, text_frame>::read_one() {
                 websocket_logger.debug("Received close frame.");
                 handle_event(connection_event::recv_close);
                 // datatracker.ietf.org/doc/html/rfc6455#section-5.5.1
-                return close(true);
+                return send_close().then([this]() { return _input.close(); });
             case opcodes::PING:
                 websocket_logger.debug("Received ping frame.");
                 return handle_ping(_websocket_parser.result());
@@ -253,9 +273,8 @@ future<> basic_connection<is_client, text_frame>::read_one() {
                 ;
             }
         } else if (_websocket_parser.eof()) {
-            _read_closed = true;
             handle_event(connection_event::read_exit);
-            return make_ready_future();
+            return _input.close();
         }
 
         throw exception("Parse websocket frame failed");
