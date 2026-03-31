@@ -19,6 +19,7 @@
  * Copyright 2024 ScyllaDB
  */
 
+#include <exception>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -102,12 +103,17 @@ future<> basic_connection<is_client, text_frame>::read_loop() {
             _handler(_input, _output),
             do_until([this] {return stop_read_loop();}, [this] {
                 return read_one();
+            }).handle_exception([this](std::exception_ptr e){
+                websocket_logger.debug("read_loop encounter an exception {}", e);
+                return _input.close().then([e = std::move(e)] () {
+                    return make_exception_future(std::move(e));
+                });
             })
         ).discard_result()
-        .finally([this](){
+        .finally([this] () {
             if (!_read_closed) {
                 handle_event(connection_event::read_exit);
-                return _read_buf.close();
+                return when_all_succeed(_read_buf.close(), _output.close()).discard_result();
             }
 
             return make_ready_future();
@@ -132,11 +138,10 @@ future<> basic_connection<is_client, text_frame>::response_loop() {
 
             return make_ready_future();
         });
-    }).finally([this](){
+    }).finally([this] () {
         this->handle_event(connection_event::write_exit);
         return this->_write_buf.close();
-    })
-;
+    });
 }
 
 template <bool is_client, bool text_frame>
@@ -157,6 +162,7 @@ void basic_connection<is_client, text_frame>::handle_event(connection_event even
             SEASTAR_ASSERT(connection_event::read_exit == event || connection_event::write_exit == event);
             break;
         case websocket_state::closing:
+            SEASTAR_ASSERT(connection_event::handshake_done != event);
             if (connection_event::close_sending == event) {
                 SEASTAR_ASSERT(!_close_sent);
                 SEASTAR_ASSERT(_close_recv);
@@ -182,11 +188,12 @@ void basic_connection<is_client, text_frame>::handle_event(connection_event even
             _state = websocket_state::closed;
             break;
         case websocket_state::open:
+            SEASTAR_ASSERT(connection_event::handshake_done != event && connection_event::close_sent != event);
             if (connection_event::close_sending == event) {
-                SEASTAR_ASSERT(!_close_sent);
+                SEASTAR_ASSERT(!_close_sent && !_close_recv);
                 _state = websocket_state::closing;
             } else if (connection_event::recv_close == event) {
-                SEASTAR_ASSERT(!_close_recv);
+                SEASTAR_ASSERT(!_close_recv && !_close_sent);
                 _close_recv = true;
                 _state = websocket_state::closing;
             }  else if (connection_event::read_exit == event) {
@@ -230,13 +237,13 @@ future<> basic_connection<is_client, text_frame>::close(bool send_close) {
 template <bool is_client, bool text_frame>
 bool basic_connection<is_client, text_frame>::stop_read_loop() {
     return _state == websocket_state::closed
-                    || (_state == websocket_state::closing && this->_close_recv);
+                    || (_state == websocket_state::closing && (_close_recv || _read_closed));
 }
 
 template <bool is_client, bool text_frame>
 bool basic_connection<is_client, text_frame>::stop_response_loop() {
     return _state == websocket_state::closed
-                    || (_state == websocket_state::closing && this->_close_sent);
+                    || (_state == websocket_state::closing && (_close_sent || _write_closed));
 }
 
 template <bool is_client, bool text_frame>
@@ -274,7 +281,7 @@ future<> basic_connection<is_client, text_frame>::read_one() {
             }
         } else if (_websocket_parser.eof()) {
             handle_event(connection_event::read_exit);
-            return _input.close();
+            return when_all_succeed(_input.close(), _output.close()).discard_result();
         }
 
         throw exception("Parse websocket frame failed");

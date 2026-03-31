@@ -19,6 +19,8 @@
  * Copyright 2021 ScyllaDB
  */
 
+#include <exception>
+#include <seastar/core/when_all.hh>
 #include <seastar/websocket/common.hh>
 #include <seastar/websocket/server.hh>
 #include <seastar/core/gate.hh>
@@ -84,12 +86,15 @@ future<> server::stop() {
     for (auto&& l : _listeners) {
         l.abort_accept();
     }
+
     return parallel_for_each(_connections, [] (server_connection& conn) {
-        return conn.close(true).handle_exception([] (auto ignored) {});
-    }).finally([this](){
+            return conn.close(true).handle_exception([] (auto) {});
+    }).then([this] () {
+        for (auto& conn: _connections) {
+            conn.shutdown_input();
+        }
         return _task_gate.close();
     });
-
 }
 
 server_connection::~server_connection() {
@@ -101,11 +106,12 @@ void server_connection::on_new_connection() {
 }
 
 future<> server_connection::process() {
-    return when_all_succeed(read_http_upgrade_request().then([this](){
-        handle_event(connection_event::handshake_done);
-        return read_loop();
-    }), response_loop()).discard_result().handle_exception([] (const std::exception_ptr& e) {
-        websocket_logger.debug("Processing failed: {}", e);
+    return read_http_upgrade_request()
+        .then([this]() {
+            handle_event(connection_event::handshake_done);
+            return when_all_succeed(read_loop(), response_loop()).discard_result().handle_exception([] (const std::exception_ptr& e) {
+                websocket_logger.debug("Processing failed: {}", e);
+        });
     });
 }
 
@@ -114,8 +120,7 @@ future<> server_connection::read_http_upgrade_request() {
     co_await _read_buf.consume(_http_parser);
 
     if (_http_parser.eof()) {
-        // FIXME(wineway)
-        throw websocket::exception("Unrecognized upgrade request");
+        throw websocket::exception("Connection closed before receiving upgrade request");
     }
     std::unique_ptr<http::request> req = _http_parser.get_parsed_request();
     if (_http_parser.failed()) {
